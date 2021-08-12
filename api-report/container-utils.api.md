@@ -4,16 +4,14 @@
 
 ```ts
 
-import { ICriticalContainerError } from '@fluidframework/container-definitions';
 import { IErrorBase } from '@fluidframework/container-definitions';
+import { IFluidErrorBase } from '@fluidframework/telemetry-utils';
 import { IGenericError } from '@fluidframework/container-definitions';
 import { ISequencedDocumentMessage } from '@fluidframework/protocol-definitions';
 import { ITelemetryProperties } from '@fluidframework/common-definitions';
 import { IThrottlingWarning } from '@fluidframework/container-definitions';
+import { IWriteableLoggingError } from '@fluidframework/telemetry-utils';
 import { LoggingError } from '@fluidframework/telemetry-utils';
-
-// @public
-export function CreateContainerError(originalError: any, props?: ITelemetryProperties): ICriticalContainerError;
 
 // @public
 export const CreateProcessingError: typeof DataProcessingError.wrapIfUnrecognized;
@@ -28,13 +26,15 @@ export class DataCorruptionError extends LoggingError implements IErrorBase {
 }
 
 // @public (undocumented)
-export class DataProcessingError extends LoggingError implements IErrorBase {
-    constructor(errorMessage: string, props?: ITelemetryProperties);
+export class DataProcessingError extends LoggingError implements IErrorBase, IFluidErrorBase {
+    constructor(errorMessage: string, fluidErrorCode: string, props?: ITelemetryProperties);
     // (undocumented)
     readonly canRetry = false;
     // (undocumented)
     readonly errorType = ContainerErrorType.dataProcessingError;
-    static wrapIfUnrecognized(originalError: any, message: ISequencedDocumentMessage | undefined): ICriticalContainerError;
+    // (undocumented)
+    readonly fluidErrorCode: string;
+    static wrapIfUnrecognized(originalError: any, errorCodeIfNone: string, message: ISequencedDocumentMessage | undefined): IFluidErrorBase;
 }
 
 // @public (undocumented)
@@ -48,12 +48,14 @@ export const extractSafePropertiesFromMessage: (message: ISequencedDocumentMessa
 };
 
 // @public
-export class GenericError extends LoggingError implements IGenericError {
-    constructor(errorMessage: string, error?: any, props?: ITelemetryProperties);
+export class GenericError extends LoggingError implements IGenericError, IFluidErrorBase {
+    constructor(fluidErrorCode: string, error?: any, props?: ITelemetryProperties);
     // (undocumented)
     readonly error?: any;
     // (undocumented)
     readonly errorType = ContainerErrorType.genericError;
+    // (undocumented)
+    readonly fluidErrorCode: string;
 }
 
 // @public
@@ -67,7 +69,16 @@ export class ThrottlingWarning extends LoggingError implements IThrottlingWarnin
 }
 
 // @public
-export function wrapError<T>(error: any, newErrorFn: (m: string) => T): T;
+export class UsageError extends LoggingError implements IFluidErrorBase {
+    constructor(fluidErrorCode: string);
+    // (undocumented)
+    readonly errorType = "usageError";
+    // (undocumented)
+    readonly fluidErrorCode: string;
+}
+
+// @public
+export function wrapError<T extends IWriteableLoggingError>(error: any, newErrorFn: (m: string) => T): T;
 
 
 // (No @packageDocumentation comment for this package)

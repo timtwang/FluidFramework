@@ -7,6 +7,7 @@ import { strict as assert } from "assert";
 import { IFluidCodeDetails, IRequest } from "@fluidframework/core-interfaces";
 import {
     IGenericError,
+    IPendingLocalState,
     ContainerErrorType,
     LoaderHeader,
 } from "@fluidframework/container-definitions";
@@ -19,6 +20,7 @@ import {
 } from "@fluidframework/container-loader";
 import {
     IDocumentServiceFactory,
+    IFluidResolvedUrl,
 } from "@fluidframework/driver-definitions";
 import { MockDocumentDeltaConnection } from "@fluidframework/test-loader-utils";
 import {
@@ -111,16 +113,17 @@ describeNoCompat("Container", (getTestObjectProvider) => {
             mockFactory.createDocumentService = async (resolvedUrl) => {
                 const service = await documentServiceFactory.createDocumentService(resolvedUrl);
                 // Issue typescript-eslint/typescript-eslint #1256
-                // eslint-disable-next-line prefer-promise-reject-errors
-                service.connectToStorage = async () => Promise.reject(false);
+                service.connectToStorage = async () => Promise.reject(new Error("expectedFailure"));
                 return service;
             };
 
             await loadContainer({ documentServiceFactory: mockFactory });
             assert.fail("Error expected");
         } catch (error) {
-            const err = error as IGenericError;
-            success = err.error as boolean;
+            assert.strictEqual(error.errorType, ContainerErrorType.genericError, "Error should be a general error");
+            const genericError = error as IGenericError;
+            assert.equal(genericError.message, "expectedFailure", "Expected the injected error message");
+            success = false;
         }
         assert.strictEqual(success, false);
     });
@@ -134,17 +137,17 @@ describeNoCompat("Container", (getTestObjectProvider) => {
             mockFactory.createDocumentService = async (resolvedUrl) => {
                 const service = await documentServiceFactory.createDocumentService(resolvedUrl);
                 // Issue typescript-eslint/typescript-eslint #1256
-                // eslint-disable-next-line prefer-promise-reject-errors
-                service.connectToDeltaStorage = async () => Promise.reject(false);
+                service.connectToDeltaStorage = async () => Promise.reject(new Error("expectedFailure"));
                 return service;
             };
             const container2 = await loadContainer({ documentServiceFactory: mockFactory });
             await waitContainerToCatchUp(container2);
             assert.fail("Error expected");
         } catch (error) {
-            assert.strictEqual(error.errorType, ContainerErrorType.genericError, "Error is not a general error");
+            assert.strictEqual(error.errorType, ContainerErrorType.genericError, "Error should be a general error");
             const genericError = error as IGenericError;
-            success = genericError.error as boolean;
+            assert.equal(genericError.message, "expectedFailure", "Expected the injected error message");
+            success = false;
         }
         assert.strictEqual(success, false);
     });
@@ -251,8 +254,25 @@ describeNoCompat("Container", (getTestObjectProvider) => {
         });
 
         container.forceReadonly(true);
-        assert.strictEqual(container.readonly, true);
+        assert.strictEqual(container.readOnlyInfo.readonly, true);
 
         assert.strictEqual(runCount, 1);
+    });
+
+    it("closeAndGetPendingLocalState() called on container", async () => {
+        const runtimeFactory = (_?: unknown) => new TestContainerRuntimeFactory(
+            TestDataObjectType,
+            getDataStoreFactory());
+
+        const localTestObjectProvider = new TestObjectProvider(
+            Loader,
+            provider.driver,
+            runtimeFactory);
+
+        const container = await localTestObjectProvider.makeTestContainer() as Container;
+
+        const pendingLocalState: IPendingLocalState = JSON.parse(container.closeAndGetPendingLocalState());
+        assert.strictEqual(container.closed, true);
+        assert.strictEqual(pendingLocalState.url, (container.resolvedUrl as IFluidResolvedUrl).url);
     });
 });

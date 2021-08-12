@@ -64,15 +64,6 @@ export interface IRuntime extends IDisposable {
     setConnectionState(connected: boolean, clientId?: string);
 
     /**
-     * @deprecated in 0.14 async stop()
-     * Use snapshot to get a snapshot for an IRuntimeState as needed, followed by dispose
-     *
-     * Stops the runtime. Once stopped no more messages will be delivered and the context passed to the runtime
-     * on creation will no longer be active
-     */
-    stop(): Promise<{snapshot?: never, state?: never}>;
-
-    /**
      * Processes the given op (message)
      */
     process(message: ISequencedDocumentMessage, local: boolean, context: any);
@@ -121,7 +112,15 @@ export interface IContainerContext extends IDisposable {
     readonly quorum: IQuorum;
     readonly audience: IAudience | undefined;
     readonly loader: ILoader;
+    /** @deprecated - Use `taggedLogger` if present. Otherwise, be sure to handle tagged data
+     * before sending events to this logger. In time we will assume the presence of `taggedLogger`,
+     * but in the meantime, current and older loader versions buttress loggers that do not support tags.
+     * IContainerContext will retain both options, but hosts must now support tags as the loader
+     * will soon plumb taggedLogger's events (potentially tagged) to the host's logger.
+     */
     readonly logger: ITelemetryBaseLogger;
+    // The logger implementation, which would support tagged events, should be provided by the loader.
+    readonly taggedLogger?: ITelemetryBaseLogger;
     readonly serviceConfiguration: IClientConfiguration | undefined;
     pendingLocalState?: unknown;
 

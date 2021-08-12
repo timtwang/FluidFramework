@@ -12,11 +12,13 @@ export type CacheContentType = "snapshot" | "ops";
 
 // @public (undocumented)
 export interface HostStoragePolicy {
+    cacheCreateNewSummary?: boolean;
     // (undocumented)
     concurrentOpsBatches?: number;
     concurrentSnapshotFetch?: boolean;
     // (undocumented)
     enableRedeemFallback?: boolean;
+    fetchBinarySnapshotFormat?: boolean;
     // (undocumented)
     opsBatchSize?: number;
     opsCaching?: IOpsCachingPolicy;

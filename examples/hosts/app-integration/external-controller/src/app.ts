@@ -3,20 +3,41 @@
  * Licensed under the MIT License.
  */
 import { SharedMap } from "@fluid-experimental/fluid-framework";
-import { FrsClient, FrsConnectionConfig, InsecureTokenProvider } from "@fluid-experimental/frs-client";
+import {
+    FrsAzFunctionTokenProvider,
+    FrsClient,
+    FrsConnectionConfig,
+    InsecureTokenProvider,
+} from "@fluid-experimental/frs-client";
 import { generateUser } from "@fluidframework/server-services-client";
 import { DiceRollerController } from "./controller";
 import { ConsoleLogger } from "./ConsoleLogger";
 import { renderAudience, renderDiceRoller } from "./view";
 
+export interface ICustomUserDetails {
+    gender: string;
+    email: string;
+}
+
+const userDetails: ICustomUserDetails = {
+    gender: "female",
+    email: "xyz@microsoft.com",
+};
+
 // Define the server we will be using and initialize Fluid
 const useFrs = process.env.FLUID_CLIENT === "frs";
 
-const user = generateUser();
+const user = generateUser() as any;
+
+const frsAzUser = {
+    userId: user.id,
+    userName: user.name,
+    additionalDetails: userDetails,
+};
 
 const connectionConfig: FrsConnectionConfig = useFrs ? {
     tenantId: "",
-    tokenProvider: new InsecureTokenProvider("", user),
+    tokenProvider: new FrsAzFunctionTokenProvider("", frsAzUser),
     orderer: "",
     storage: "",
 } : {
