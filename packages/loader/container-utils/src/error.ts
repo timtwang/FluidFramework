@@ -10,15 +10,14 @@ import {
     IThrottlingWarning,
 } from "@fluidframework/container-definitions";
 import {
-    isILoggingError,
     extractLogSafeErrorProperties,
     LoggingError,
-    IWriteableLoggingError,
     isValidLegacyError,
     IFluidErrorBase,
     normalizeError,
+    hasErrorInstanceId,
 } from "@fluidframework/telemetry-utils";
-import { ITelemetryProperties } from "@fluidframework/common-definitions";
+import { ITelemetryLogger, ITelemetryProperties } from "@fluidframework/common-definitions";
 import { ISequencedDocumentMessage } from "@fluidframework/protocol-definitions";
 
 /**
@@ -46,11 +45,12 @@ export class GenericError extends LoggingError implements IGenericError, IFluidE
 /**
  * Warning emitted when requests to storage are being throttled.
  */
-export class ThrottlingWarning extends LoggingError implements IThrottlingWarning {
+export class ThrottlingWarning extends LoggingError implements IThrottlingWarning, IFluidErrorBase {
     readonly errorType = ContainerErrorType.throttlingError;
 
     constructor(
         message: string,
+        readonly fluidErrorCode: string,
         readonly retryAfterSeconds: number,
         props?: ITelemetryProperties,
     ) {
@@ -61,11 +61,15 @@ export class ThrottlingWarning extends LoggingError implements IThrottlingWarnin
      * Wrap the given error as a ThrottlingWarning, preserving any safe properties for logging
      * and prefixing the wrapped error message with messagePrefix.
      */
-    static wrap(error: any, messagePrefix: string, retryAfterSeconds: number): IThrottlingWarning {
+    static wrap(
+        error: any,
+        errorCode: string,
+        retryAfterSeconds: number,
+        logger: ITelemetryLogger,
+    ): IThrottlingWarning {
         const newErrorFn =
-            (errMsg: string) =>
-                new ThrottlingWarning(`${messagePrefix}: ${errMsg}`, retryAfterSeconds);
-        return wrapError(error, newErrorFn);
+            (errMsg: string) => new ThrottlingWarning(errMsg, errorCode, retryAfterSeconds);
+        return wrapErrorAndLog(error, newErrorFn, logger);
     }
 }
 
@@ -81,12 +85,15 @@ export class UsageError extends LoggingError implements IFluidErrorBase {
     }
 }
 
-export class DataCorruptionError extends LoggingError implements IErrorBase {
+export class DataCorruptionError extends LoggingError implements IErrorBase, IFluidErrorBase {
     readonly errorType = ContainerErrorType.dataCorruptionError;
     readonly canRetry = false;
 
-    constructor(errorMessage: string, props: ITelemetryProperties) {
-        super(errorMessage, { ...props, dataProcessingError: 1 });
+    constructor(
+        readonly fluidErrorCode: string,
+        props: ITelemetryProperties,
+    ) {
+        super(fluidErrorCode, { ...props, dataProcessingError: 1 });
     }
 }
 
@@ -149,28 +156,55 @@ export const extractSafePropertiesFromMessage = (message: ISequencedDocumentMess
  export const CreateProcessingError = DataProcessingError.wrapIfUnrecognized;
 
 /**
- * Take an unknown error object and extract certain known properties to be included in a new error object.
- * The stack is preserved, along with any safe-to-log telemetry props.
- * @param error - An error that was presumably caught, thrown from unknown origins
+ * Create a new error, wrapping and caused by the given unknown error.
+ * Copies the inner error's message and stack over but otherwise uses newErrorFn to define the error.
+ * The inner error's instance id will also be logged for telemetry analysis.
+ * @param innerError - An error from untrusted/unknown origins
  * @param newErrorFn - callback that will create a new error given the original error's message
  * @returns A new error object "wrapping" the given error
  */
-export function wrapError<T extends IWriteableLoggingError>(
-    error: any,
-    newErrorFn: (m: string) => T,
+export function wrapError<T extends IFluidErrorBase>(
+    innerError: unknown,
+    newErrorFn: (message: string) => T,
 ): T {
     const {
         message,
         stack,
-    } = extractLogSafeErrorProperties(error, false /* sanitizeStack */);
-    const props = isILoggingError(error) ? error.getTelemetryProperties() : {};
+    } = extractLogSafeErrorProperties(innerError, false /* sanitizeStack */);
 
     const newError = newErrorFn(message);
-    newError.addTelemetryProperties(props);
 
     if (stack !== undefined) {
-        Object.assign(newError, { stack });
+        // supposedly setting stack on an Error can throw.
+        try {
+            Object.assign(newError, { stack });
+        } catch (errorSettingStack) {
+            newError.addTelemetryProperties({ stack2: stack });
+        }
     }
+
+    if (hasErrorInstanceId(innerError)) {
+        newError.addTelemetryProperties({ innerErrorInstanceId: innerError.errorInstanceId });
+    }
+
+    return newError;
+}
+
+/** The same as wrapError, but also logs the innerError, including the wrapping error's instance id */
+export function wrapErrorAndLog<T extends IFluidErrorBase>(
+    innerError: unknown,
+    newErrorFn: (message: string) => T,
+    logger: ITelemetryLogger,
+) {
+    const newError = wrapError(innerError, newErrorFn);
+    const wrappedByErrorInstanceId = hasErrorInstanceId(newError)
+        ? newError.errorInstanceId
+        : undefined;
+
+    logger.sendTelemetryEvent({
+        eventName: "WrapError",
+        wrappedByErrorInstanceId,
+    }, innerError);
 
     return newError;
 }

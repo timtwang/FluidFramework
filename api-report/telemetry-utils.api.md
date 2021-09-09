@@ -17,6 +17,7 @@ import { ITelemetryGenericEvent } from '@fluidframework/common-definitions';
 import { ITelemetryLogger } from '@fluidframework/common-definitions';
 import { ITelemetryPerformanceEvent } from '@fluidframework/common-definitions';
 import { ITelemetryProperties } from '@fluidframework/common-definitions';
+import { TelemetryEventCategory } from '@fluidframework/common-definitions';
 import { TelemetryEventPropertyType } from '@fluidframework/common-definitions';
 import { TypedEventEmitter } from '@fluidframework/common-utils';
 
@@ -59,6 +60,11 @@ export function extractLogSafeErrorProperties(error: any, sanitizeStack: boolean
 // @public (undocumented)
 export function generateStack(): string | undefined;
 
+// @public (undocumented)
+export const hasErrorInstanceId: (x: any) => x is {
+    errorInstanceId: string;
+};
+
 // @public
 export interface IFluidErrorAnnotations {
     errorCodeIfNone?: string;
@@ -66,12 +72,12 @@ export interface IFluidErrorAnnotations {
 }
 
 // @public
-export interface IFluidErrorBase extends Readonly<Partial<Error>>, IWriteableLoggingError {
-    // (undocumented)
+export interface IFluidErrorBase extends Readonly<Partial<Error>> {
+    addTelemetryProperties: (props: ITelemetryProperties) => void;
+    readonly errorInstanceId: string;
     readonly errorType: string;
-    // (undocumented)
     readonly fluidErrorCode: string;
-    // (undocumented)
+    getTelemetryProperties(): ITelemetryProperties;
     readonly message: string;
 }
 
@@ -100,7 +106,7 @@ export function isValidLegacyError(e: any): e is Omit<IFluidErrorBase, "fluidErr
 // @public (undocumented)
 export interface ITelemetryLoggerPropertyBag {
     // (undocumented)
-    [index: string]: TelemetryEventPropertyType | (() => TelemetryEventPropertyType);
+    [index: string]: TelemetryEventPropertyTypes | (() => TelemetryEventPropertyTypes);
 }
 
 // @public (undocumented)
@@ -112,17 +118,11 @@ export interface ITelemetryLoggerPropertyBags {
 }
 
 // @public
-export interface IWriteableLoggingError {
-    // (undocumented)
-    addTelemetryProperties: (props: ITelemetryProperties) => void;
-    // (undocumented)
-    getTelemetryProperties(): ITelemetryProperties;
-}
-
-// @public
-export class LoggingError extends Error implements ILoggingError {
+export class LoggingError extends Error implements ILoggingError, Pick<IFluidErrorBase, "errorInstanceId"> {
     constructor(message: string, props?: ITelemetryProperties, omitPropsFromLogging?: Set<string>);
     addTelemetryProperties(props: ITelemetryProperties): void;
+    // (undocumented)
+    readonly errorInstanceId: string;
     getTelemetryProperties(): ITelemetryProperties;
     }
 
@@ -180,6 +180,9 @@ export enum TelemetryDataTag {
     UserData = "UserData"
 }
 
+// @public (undocumented)
+export type TelemetryEventPropertyTypes = TelemetryEventPropertyType | ITaggedTelemetryPropertyType;
+
 // @public
 export abstract class TelemetryLogger implements ITelemetryLogger {
     constructor(namespace?: string | undefined, properties?: ITelemetryLoggerPropertyBags | undefined);
@@ -201,6 +204,9 @@ export abstract class TelemetryLogger implements ITelemetryLogger {
     sendErrorEvent(event: ITelemetryErrorEvent, error?: any): void;
     sendPerformanceEvent(event: ITelemetryPerformanceEvent, error?: any): void;
     sendTelemetryEvent(event: ITelemetryGenericEvent, error?: any): void;
+    protected sendTelemetryEventCore(event: ITelemetryGenericEvent & {
+        category: TelemetryEventCategory;
+    }, error?: any): void;
 }
 
 // @public

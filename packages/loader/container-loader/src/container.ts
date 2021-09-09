@@ -34,6 +34,7 @@ import {
 } from "@fluidframework/container-definitions";
 import {
     DataCorruptionError,
+    DataProcessingError,
     extractSafePropertiesFromMessage,
     GenericError,
     UsageError,
@@ -51,6 +52,7 @@ import {
     ensureFluidResolvedUrl,
     combineAppAndProtocolSummary,
     runWithRetry,
+    canRetryOnError,
 } from "@fluidframework/driver-utils";
 import {
     isSystemMessage,
@@ -225,12 +227,13 @@ export async function waitContainerToCatchUp(container: Container) {
 //    aggressive noop sending from client side.
 // 5. Number of ops sent by all clients is proportional to number of "write" clients (every client sends noops),
 //    but number of sequenced noops is a function of time (one op per 2 seconds at most).
+//    We should consider impact to both outbound traffic (might be huge, depends on number of clients) and file size.
 // Please also see Issue #5629 for more discussions.
 //
 // With that, the current algorithm is as follows:
-// 1. Sent noop 250 ms of receiving an op if no ops were sent by this client within this timeframe.
-//    This will ensure that MSN moves forward with reasonable speed. If that results in too many noops, server timeout
-//    of 2000ms should be reconsidered to be increased.
+// 1. Sent noop 2000 ms of receiving an op if no ops were sent by this client within this timeframe.
+//    This will ensure that MSN moves forward with reasonable speed. If that results in too many sequenced noops,
+//    server timeout of 2000ms should be reconsidered to be increased.
 // 2. If there are more than 50 ops received without sending any ops, send noop to keep collab window small.
 //    Note that system ops (including noops themselves) are excluded, so it's 1 noop per 50 real ops.
 export class CollabWindowTracker {
@@ -240,7 +243,7 @@ export class CollabWindowTracker {
     constructor(
         private readonly submit: (type: MessageType, contents: any) => void,
         private readonly activeConnection: () => boolean,
-        NoopTimeFrequency: number = 250,
+        NoopTimeFrequency: number = 2000,
         private readonly NoopCountFrequency: number = 50,
     ) {
         this.timer = new Timer(NoopTimeFrequency, () => {
@@ -341,7 +344,7 @@ export class Container extends EventEmitterWithErrorHandling<IContainerEvents> i
                 // It is also default mode in general.
                 const defaultMode: IContainerLoadMode = { opsBeforeReturn: "cached" };
                 assert(pendingLocalState === undefined || loadOptions.loadMode === undefined,
-                    0x1e1 /* "pending state requires immidiate connection!" */);
+                    0x1e1 /* "pending state requires immediate connection!" */);
                 const mode: IContainerLoadMode = loadOptions.loadMode ?? defaultMode;
 
                 const onClosed = (err?: ICriticalContainerError) => {
@@ -817,6 +820,10 @@ export class Container extends EventEmitterWithErrorHandling<IContainerEvents> i
         const appSummary: ISummaryTree = this.context.createSummary();
         const protocolSummary = this.captureProtocolSummary();
         const combinedSummary = combineAppAndProtocolSummary(appSummary, protocolSummary);
+
+        if (this.loader.services.detachedBlobStorage && this.loader.services.detachedBlobStorage.size > 0) {
+            combinedSummary.tree[".hasAttachmentBlobs"] = { type: SummaryType.Blob, content: "true" };
+        }
         return JSON.stringify(combinedSummary);
     }
 
@@ -857,9 +864,9 @@ export class Container extends EventEmitterWithErrorHandling<IContainerEvents> i
                 this.context.notifyAttaching();
             }
 
+            // Actually go and create the resolved document
             const createNewResolvedUrl = await this.urlResolver.resolve(request);
             ensureFluidResolvedUrl(createNewResolvedUrl);
-            // Actually go and create the resolved document
             if (this.service === undefined) {
                 this.service = await runWithRetry(
                     async () => this.serviceFactory.createContainer(
@@ -879,11 +886,26 @@ export class Container extends EventEmitterWithErrorHandling<IContainerEvents> i
             this._resolvedUrl = resolvedUrl;
             await this.connectStorageService();
 
-            // upload blobs here (NYI)
-
-            // post summary here
             if (hasAttachmentBlobs) {
-                const appSummary: ISummaryTree = this.context.createSummary();
+                // upload blobs to storage
+                assert(!!this.loader.services.detachedBlobStorage, 0x24e /* "assertion for type narrowing" */);
+
+                // build a table mapping IDs assigned locally to IDs assigned by storage and pass it to runtime to
+                // support blob handles that only know about the local IDs
+                const redirectTable = new Map<string, string>();
+                // if new blobs are added while uploading, upload them too
+                while (redirectTable.size < this.loader.services.detachedBlobStorage.size) {
+                    const newIds = this.loader.services.detachedBlobStorage.getBlobIds().filter(
+                        (id) => !redirectTable.has(id));
+                    for (const id of newIds) {
+                        const blob = await this.loader.services.detachedBlobStorage.readBlob(id);
+                        const response = await this.storageService.createBlob(blob);
+                        redirectTable.set(id, response.id);
+                    }
+                }
+
+                // take summary and upload
+                const appSummary: ISummaryTree = this.context.createSummary(redirectTable);
                 const protocolSummary = this.captureProtocolSummary();
                 summary = combineAppAndProtocolSummary(appSummary, protocolSummary);
 
@@ -895,8 +917,6 @@ export class Container extends EventEmitterWithErrorHandling<IContainerEvents> i
                     ackHandle: undefined,
                     proposalHandle: undefined,
                 });
-
-                assert(!hasAttachmentBlobs, 0x206 /* "attaching container with blobs is not yet implemented" */);
             }
 
             this._attachState = AttachState.Attached;
@@ -908,8 +928,20 @@ export class Container extends EventEmitterWithErrorHandling<IContainerEvents> i
                 this.resumeInternal({ fetchOpsFromStorage: false, reason: "createDetached" });
             }
         } catch(error) {
-            this.close(error);
-            throw error;
+            // we should retry upon any retriable errors, so we shouldn't see them here
+            assert(!canRetryOnError(error), 0x24f /* "retriable error thrown from attach()" */);
+
+            // add resolved URL on error object so that host has the ability to find this document and delete it
+            const newError = DataProcessingError.wrapIfUnrecognized(
+                error, "errorWhileUploadingBlobsWhileAttaching", undefined);
+            const resolvedUrl = this.resolvedUrl;
+            if (resolvedUrl) {
+                ensureFluidResolvedUrl(resolvedUrl);
+                newError.addTelemetryProperties({ resolvedUrl: resolvedUrl.url });
+            }
+            this.close(newError);
+            // eslint-disable-next-line @typescript-eslint/no-throw-literal
+            throw newError;
         }
     }
 
@@ -1339,6 +1371,12 @@ export class Container extends EventEmitterWithErrorHandling<IContainerEvents> i
     }
 
     private async rehydrateDetachedFromSnapshot(detachedContainerSnapshot: ISummaryTree) {
+        if (detachedContainerSnapshot.tree[".hasAttachmentBlobs"] !== undefined) {
+            assert(!!this.loader.services.detachedBlobStorage && this.loader.services.detachedBlobStorage.size > 0,
+                0x250 /* "serialized container with attachment blobs must be rehydrated with detached blob storage" */);
+            delete detachedContainerSnapshot.tree[".hasAttachmentBlobs"];
+        }
+
         const snapshotTree = getSnapshotTreeFromSerializedContainer(detachedContainerSnapshot);
         this._storage.loadSnapshotForRehydratingContainer(snapshotTree);
         const attributes = await this.getDocumentAttributes(this._storage, snapshotTree);
@@ -1641,17 +1679,13 @@ export class Container extends EventEmitterWithErrorHandling<IContainerEvents> i
         const duration = time - this.connectionTransitionTimes[oldState];
 
         let durationFromDisconnected: number | undefined;
-        let connectionMode: string | undefined;
         let connectionInitiationReason: string | undefined;
         let autoReconnect: ReconnectMode | undefined;
         let checkpointSequenceNumber: number | undefined;
-        let sequenceNumber: number | undefined;
         let opsBehind: number | undefined;
         if (value === ConnectionState.Disconnected) {
             autoReconnect = this._deltaManager.reconnectMode;
         } else {
-            connectionMode = this._deltaManager.connectionMode;
-            sequenceNumber = this.deltaManager.lastSequenceNumber;
             if (value === ConnectionState.Connected) {
                 durationFromDisconnected = time - this.connectionTransitionTimes[ConnectionState.Disconnected];
                 durationFromDisconnected = TelemetryLogger.formatTick(durationFromDisconnected);
@@ -1659,7 +1693,7 @@ export class Container extends EventEmitterWithErrorHandling<IContainerEvents> i
                 // This info is of most interest on establishing connection only.
                 checkpointSequenceNumber = this.deltaManager.lastKnownSeqNumber;
                 if (this.deltaManager.hasCheckpointSequenceNumber) {
-                    opsBehind = checkpointSequenceNumber - sequenceNumber;
+                    opsBehind = checkpointSequenceNumber - this.deltaManager.lastSequenceNumber;
                 }
             }
             if (this.firstConnection) {
@@ -1681,13 +1715,12 @@ export class Container extends EventEmitterWithErrorHandling<IContainerEvents> i
             socketDocumentId: this._deltaManager.socketDocumentId,
             pendingClientId: this.connectionStateHandler.pendingClientId,
             clientId: this.clientId,
-            connectionMode,
             autoReconnect,
             opsBehind,
             online: OnlineStatus[isOnline()],
             lastVisible: this.lastVisible !== undefined ? performance.now() - this.lastVisible : undefined,
             checkpointSequenceNumber,
-            sequenceNumber,
+            ...this._deltaManager.connectionProps(),
         });
 
         if (value === ConnectionState.Connected) {
@@ -1762,17 +1795,17 @@ export class Container extends EventEmitterWithErrorHandling<IContainerEvents> i
         // Check and report if we're getting messages from a clientId that we previously
         // flagged as shouldHaveLeft, or from a client that's not in the quorum but should be
         if (message.clientId != null) {
-            let errorMsg: string | undefined;
+            let errorCode: string | undefined;
             const client: ILocalSequencedClient | undefined =
                 this.getQuorum().getMember(message.clientId);
             if (client === undefined && message.type !== MessageType.ClientJoin) {
-                errorMsg = "messageClientIdMissingFromQuorum";
+                errorCode = "messageClientIdMissingFromQuorum";
             } else if (client?.shouldHaveLeft === true && message.type !== MessageType.NoOp) {
-                errorMsg = "messageClientIdShouldHaveLeft";
+                errorCode = "messageClientIdShouldHaveLeft";
             }
-            if (errorMsg !== undefined) {
+            if (errorCode !== undefined) {
                 const error = new DataCorruptionError(
-                    errorMsg,
+                    errorCode,
                     extractSafePropertiesFromMessage(message));
                 this.close(normalizeError(error));
             }

@@ -57,6 +57,7 @@ import {
     waitForConnectedState,
     NonRetryableError,
     DeltaStreamConnectionForbiddenError,
+    GenericNetworkError,
 } from "@fluidframework/driver-utils";
 import {
     ThrottlingWarning,
@@ -81,7 +82,7 @@ function getNackReconnectInfo(nackContent: INackContent) {
 const createReconnectError = (prefix: string, err: any) =>
     wrapError(
         err,
-        (errorMessage: string) => createGenericNetworkError(`${prefix}: ${errorMessage}`, true /* canRetry */),
+        (errorMessage: string) => new GenericNetworkError(`${prefix}: ${errorMessage}`, true /* canRetry */),
     );
 
 export interface IConnectionArgs {
@@ -372,6 +373,23 @@ export class DeltaManager
     public shouldJoinWrite(): boolean {
         // We don't have to wait for ack for topmost NoOps. So subtract those.
         return this.clientSequenceNumberObserved < (this.clientSequenceNumber - this.trailingNoopCount);
+    }
+    /**
+     * Returns set of props that can be logged in telemetry that provide some insights / statistics
+     * about current or last connection (if there is no connection at the moment)
+    */
+    public connectionProps(): ITelemetryProperties {
+        if (this.connection !== undefined) {
+            return {
+                sequenceNumber: this.lastSequenceNumber,
+                connectionMode: this.connectionMode,
+            };
+        } else {
+            return {
+                // Report how many ops this client sent in last disconnected session
+                sentOps: this.clientSequenceNumber,
+            };
+        }
     }
 
     /**
@@ -973,8 +991,12 @@ export class DeltaManager
         if (delayMs > 0 && (timeNow + delayMs > this.timeTillThrottling)) {
             this.timeTillThrottling = timeNow + delayMs;
 
-            const throttlingWarning: IThrottlingWarning =
-                ThrottlingWarning.wrap(error, "Service busy/throttled", delayMs / 1000 /* retryAfterSeconds */);
+            const throttlingWarning: IThrottlingWarning = ThrottlingWarning.wrap(
+                error,
+                "deltaManagerEmitDelayInfo",
+                delayMs / 1000 /* retryAfterSeconds */,
+                this.logger,
+            );
             this.emit("throttled", throttlingWarning);
         }
     }
@@ -1461,7 +1483,7 @@ export class DeltaManager
 
         // Watch the minimum sequence number and be ready to update as needed
         if (this.minSequenceNumber > message.minimumSequenceNumber) {
-            throw new DataCorruptionError("msn moves backwards", {
+            throw new DataCorruptionError("msnMovesBackwards", {
                 ...extractLogSafeMessageProperties(message),
                 clientId: this.connection?.clientId,
             });
@@ -1469,7 +1491,7 @@ export class DeltaManager
         this.minSequenceNumber = message.minimumSequenceNumber;
 
         if (message.sequenceNumber !== this.lastProcessedSequenceNumber + 1) {
-            throw new DataCorruptionError("non-seq seq#", {
+            throw new DataCorruptionError("nonSequentialSequenceNumber", {
                 ...extractLogSafeMessageProperties(message),
                 clientId: this.connection?.clientId,
             });
